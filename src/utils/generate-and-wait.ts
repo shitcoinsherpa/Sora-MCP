@@ -2,19 +2,60 @@
  * Generate a video and wait for it to appear in drafts.
  *
  * Sora's generation flow:
- * 1. Enter prompt + settings on home/feed page → click Generate
- * 2. Toast: "Added to queue" — page stays on the feed
- * 3. Video appears in Drafts as a generating item
+ * 1. Enter prompt + settings → click Generate
+ * 2. Toast: "Added to queue" — page stays on current page
+ * 3. Video appears in Drafts grid (may show a spinner while generating)
  * 4. Once done, the draft becomes a playable video at /d/gen_...
  *
  * Typical timing: ~30-90s for generation to complete.
  *
- * Strategy: wait 20s up front, navigate to drafts, find the new draft,
- * go to its detail page, then poll there every 15s until a playable video appears.
- * No page refreshes — just check the DOM for a video element with a real src.
+ * Strategy:
+ * - Snapshot existing draft IDs immediately after generation starts
+ * - Wait 30s for generation to process
+ * - Poll drafts for a new entry not in the snapshot
+ * - Click into the new draft and wait for the video to be playable
  */
 import type { Page } from 'playwright';
-import { navigateTo } from '../pages/navigation.js';
+import { SELECTORS, clickElement } from '../pages/selectors.js';
+
+/**
+ * Navigate to the Drafts page via sidebar click (not URL — Sora's SPA
+ * doesn't have a reliable /library route).
+ */
+async function goToDrafts(page: Page): Promise<void> {
+  // First, close any open dialog/modal by pressing Escape
+  await page.keyboard.press('Escape');
+  await page.waitForTimeout(500);
+
+  await clickElement(page, SELECTORS.navigation.sidebar.drafts, 5000);
+  await page.waitForTimeout(3000);
+}
+
+/** Extract draft links from the current page DOM. */
+async function getDraftsFromPage(page: Page): Promise<Array<{ href: string; genId: string }>> {
+  return page.evaluate(`
+    (function() {
+      var results = [];
+      var seen = {};
+      var links = document.querySelectorAll('a[href^="/d/"]');
+      for (var i = 0; i < links.length; i++) {
+        var href = links[i].getAttribute('href') || '';
+        var genId = href.replace('/d/', '');
+        if (!seen[genId]) {
+          seen[genId] = true;
+          results.push({ href: href, genId: genId });
+        }
+      }
+      return results;
+    })()
+  `);
+}
+
+/** Extract just the gen IDs from the current page. */
+async function getDraftIdsFromPage(page: Page): Promise<string[]> {
+  const drafts = await getDraftsFromPage(page);
+  return drafts.map(d => d.genId);
+}
 
 export interface GenerateAndWaitResult {
   success: boolean;
@@ -29,48 +70,38 @@ export interface GenerateAndWaitResult {
  */
 export async function waitForNewDraft(
   page: Page,
-  opts: { timeout: number; knownGenIds?: string[] },
+  opts: { timeout: number },
 ): Promise<GenerateAndWaitResult> {
-  const { timeout, knownGenIds = [] } = opts;
+  const { timeout } = opts;
   const deadline = Date.now() + timeout;
-  const knownSet = new Set(knownGenIds);
 
-  // Phase 1: Wait for generation to start (toast appears, item enters queue).
-  // Sora takes ~30-90s, so give it 20s before even checking drafts.
-  await page.waitForTimeout(20000);
+  // Phase 1: Immediately snapshot existing drafts BEFORE the generation completes.
+  // This captures what's already there so we can detect the new one.
+  await goToDrafts(page);
+  const existingIds = new Set(await getDraftIdsFromPage(page));
 
-  // Phase 2: Navigate to drafts and find the new item.
-  await navigateTo(page, 'drafts');
-  await page.waitForTimeout(3000);
+  // Phase 2: Wait for generation to process.
+  // Sora takes ~30-90s total. Wait 30s, then start checking.
+  await page.waitForTimeout(30000);
 
+  // Phase 3: Poll drafts for a NEW entry not in the existing set.
   let targetGenId = '';
-  let targetHref = '';
 
-  // Look for the new draft (may need a couple checks if queue is slow)
-  for (let attempt = 0; attempt < 5 && Date.now() < deadline; attempt++) {
-    const drafts: Array<{ href: string; genId: string }> = await page.evaluate(`
-      (function() {
-        var results = [];
-        var links = document.querySelectorAll('a[href^="/d/"]');
-        for (var i = 0; i < links.length; i++) {
-          var href = links[i].getAttribute('href') || '';
-          results.push({ href: href, genId: href.replace('/d/', '') });
-        }
-        return results;
-      })()
-    `);
+  for (let attempt = 0; attempt < 10 && Date.now() < deadline; attempt++) {
+    // Re-navigate to refresh the drafts list
+    await goToDrafts(page);
 
-    const newDraft = drafts.find(d => !knownSet.has(d.genId));
+    const drafts = await getDraftsFromPage(page);
+
+    // Find a draft that wasn't in our initial snapshot
+    const newDraft = drafts.find(d => !existingIds.has(d.genId));
     if (newDraft) {
       targetGenId = newDraft.genId;
-      targetHref = newDraft.href;
       break;
     }
 
-    // New draft hasn't appeared yet — wait and soft-reload
-    await page.waitForTimeout(10000);
-    await page.reload({ waitUntil: 'domcontentloaded' });
-    await page.waitForTimeout(2000);
+    // Not found yet — wait 15s and try again
+    await page.waitForTimeout(15000);
   }
 
   if (!targetGenId) {
@@ -78,36 +109,48 @@ export async function waitForNewDraft(
       success: false,
       genId: '',
       detailUrl: '',
-      message: 'New draft never appeared in library. Generation may have been rejected.',
+      message: 'No new drafts found. Generation may have been rejected or is still processing.',
     };
   }
 
-  // Phase 3: Navigate to the detail page and wait for the video to become playable.
-  await page.click(`a[href="${targetHref}"]`);
+  // Phase 4: Navigate to the detail page and wait for a playable video.
+  const linkSelector = `a[href="/d/${targetGenId}"]`;
+  await page.click(linkSelector);
   await page.waitForTimeout(3000);
 
   while (Date.now() < deadline) {
-    // Check for a playable video on this detail page
     const videoState: { hasVideo: boolean; hasError: boolean; errorText: string } = await page.evaluate(`
       (function() {
         var result = { hasVideo: false, hasError: false, errorText: '' };
 
-        // Check for playable video
-        var videos = document.querySelectorAll('video[src]');
+        // Check for any video element (src or source child)
+        var videos = document.querySelectorAll('video');
         for (var i = 0; i < videos.length; i++) {
           var src = videos[i].getAttribute('src') || '';
-          if (src.includes('blob:') || src.includes('azure') || src.includes('/raw') || src.includes('.mp4')) {
+          if (src) { result.hasVideo = true; break; }
+          var sources = videos[i].querySelectorAll('source[src]');
+          if (sources.length > 0) { result.hasVideo = true; break; }
+        }
+
+        // Also check for Extend/Post buttons — these only appear on completed videos
+        var buttons = document.querySelectorAll('button');
+        for (var i = 0; i < buttons.length; i++) {
+          var txt = (buttons[i].textContent || '').trim();
+          if (txt === 'Extend' || txt === 'Post') {
             result.hasVideo = true;
             break;
           }
         }
 
-        // Check for errors
-        var text = document.body.innerText || '';
-        if (text.includes('unable to generate') || text.includes('content policy') ||
-            text.includes('not allowed') || text.includes('violates')) {
-          result.hasError = true;
-          result.errorText = (text.match(/(unable to generate[^.]*\\.|content policy[^.]*\\.|not allowed[^.]*\\.|violates[^.]*\\.)/i) || [])[0] || 'Generation rejected';
+        // Only check for errors in specific error containers, not the entire page
+        var errorEls = document.querySelectorAll('[role="alert"], [class*="error"], [class*="Error"], [class*="toast"]');
+        for (var i = 0; i < errorEls.length; i++) {
+          var elText = errorEls[i].innerText || '';
+          if (elText.includes('unable to generate') || elText.includes('content policy') || elText.includes('violates')) {
+            result.hasError = true;
+            result.errorText = elText.substring(0, 200);
+            break;
+          }
         }
 
         return result;
@@ -132,8 +175,7 @@ export async function waitForNewDraft(
       };
     }
 
-    // Still generating — wait 15s then check again (no page reload needed,
-    // Sora's SPA updates the DOM when the video is ready)
+    // Still generating — wait 15s, no reload needed on detail page.
     await page.waitForTimeout(15000);
   }
 
@@ -143,24 +185,4 @@ export async function waitForNewDraft(
     detailUrl: page.url(),
     message: `Timeout waiting for ${targetGenId} to finish generating`,
   };
-}
-
-/**
- * Get the current list of draft gen IDs (to know what's "known" before generating).
- */
-export async function getKnownDraftIds(page: Page): Promise<string[]> {
-  await navigateTo(page, 'drafts');
-  await page.waitForTimeout(2000);
-
-  return page.evaluate(`
-    (function() {
-      var results = [];
-      var links = document.querySelectorAll('a[href^="/d/"]');
-      for (var i = 0; i < links.length; i++) {
-        var href = links[i].getAttribute('href') || '';
-        results.push(href.replace('/d/', ''));
-      }
-      return results;
-    })()
-  `);
 }

@@ -145,7 +145,7 @@ async function main() {
   console.log('  Remixing with continuation prompt...\n');
 
   const chainResp = await callTool('sora_continue_chain', {
-    last_phrase: 'you are',
+    last_phrase: 'then generate a video',
     additional_instructions: 'missing nothing, include everything',
     frame_count: 12,
   });
