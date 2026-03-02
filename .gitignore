@@ -1,0 +1,11 @@
+node_modules/
+dist/
+.browser-profile/
+*.js.map
+downloads/
+screenshots/
+.env
+*.output
+tmp/
+test-screenshots/
+test-image.png
